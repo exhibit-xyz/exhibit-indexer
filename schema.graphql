@@ -5,3 +5,31 @@ type Burn @entity {
   value: BigInt!
   txHash: String!
 }
+
+type Owner @entity {
+  id: ID! # owner address
+  ownedTokens: [Token!]! @derivedFrom(field: "owner")
+}
+
+type Token @entity {
+  id: ID! # string form of tokenId
+  tokenId: Int!
+  owner: Owner!
+  uri: String!
+  transfers: [Transfer!]! @derivedFrom(field: "token")
+}
+
+type Transfer @entity {
+  id: ID!
+  token: Token!
+  from: Owner!
+  to: Owner!
+  timestamp: DateTime!
+  blockNumber: Int!
+  txHash: String! @index
+}
+
+type Attirbute {
+  traitType: String!
+  value: String!
+}
