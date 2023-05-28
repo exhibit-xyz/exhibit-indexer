@@ -1,14 +1,21 @@
 import { TypeormDatabase, Store } from '@subsquid/typeorm-store';
 import { EvmBatchProcessor, BatchProcessorItem, BatchHandlerContext } from '@subsquid/evm-processor';
 import { lookupArchive } from '@subsquid/archive-registry';
+import { TokenMetadata, fetchTokenMetadata } from './metadata';
+import { Multicall } from './abi/multicall';
 
 import { Owner, Token, Transfer } from './model';
+
 
 import * as nouns from './abi/nouns';
 import { BigNumber } from 'ethers';
 
 const NOUNS_ADDRESS = '0x9c8ff314c9bc7f6e59a9d9225fb22946427edc03';
 const EXHIBIT_BASE_ADDRESS = '0x9c8ff314c9bc7f6e59a9d9225fb20946427edc03';
+
+const MULTICALL_ADDRESS = '0x5ba1e12693dc8f9c48aad8770482f4739beed696';
+const MULTICALL_BATCH_SIZE = 10;
+
 
 type Item = BatchProcessorItem<typeof processor>;
 type Context = BatchHandlerContext<Store, Item>;
@@ -21,6 +28,12 @@ interface RawTransfer {
   timestamp: Date;
   blockNumber: number;
   txHash: string;
+}
+
+interface PartialToken {
+  id: string;
+  tokenId: number;
+  owner: Owner;
 }
 
 const processor = new EvmBatchProcessor()
@@ -98,15 +111,11 @@ processor.run(new TypeormDatabase(), async (ctx) => {
   let rawTransfers: RawTransfer[] = getRawTransfers(ctx);
 
   let owners: Map<string, Owner> = createOwners(rawTransfers);
-  let tokens: Map<string, Token> = createTokens(rawTransfers, owners);
+  let tokens: Map<string, Token> = await createTokens(ctx, rawTransfers, owners);
   let transfers: Transfer[] = createTransfers(rawTransfers, owners, tokens);
 
   let lastBatchedBlockHeader = ctx.blocks[ctx.blocks.length - 1].header;
   let contract = new nouns.Contract(ctx, lastBatchedBlockHeader, NOUNS_ADDRESS);
-  // for (let t of tokens.values()) {
-  //   const uri = await contract.tokenURI(BigNumber.from(t.tokenId));
-  //   ctx.log.info(`Token ${t.tokenId} has metadata: ${uri}`);
-  // }
 
   await ctx.store.upsert([...owners.values()]);
   await ctx.store.upsert([...tokens.values()]);
@@ -144,20 +153,18 @@ function createOwners(rawTransfers: RawTransfer[]): Map<string, Owner> {
   return owners;
 }
 
-function createTokens(rawTransfers: RawTransfer[], owners: Map<string, Owner>): Map<string, Token> {
-  let tokens: Map<string, Token> = new Map();
+async function createTokens(ctx: Context, rawTransfers: RawTransfer[], owners: Map<string, Owner>): Promise<Map<string, Token>> {
+  let tokens: Map<string, PartialToken> = new Map();
   for (let t of rawTransfers) {
     let tokenIdString = `${t.tokenId}`;
-    tokens.set(
-      tokenIdString,
-      new Token({
-        id: tokenIdString,
-        tokenId: t.tokenId,
-        owner: owners.get(t.to),
-      })
-    );
+    let ptoken: PartialToken = {
+      id: tokenIdString,
+      tokenId: t.tokenId,
+      owner: owners.get(t.to)!,
+    };
+    tokens.set(tokenIdString, ptoken);
   }
-  return tokens;
+  return await completeTokens(ctx, tokens);
 }
 
 function createTransfers(
@@ -178,3 +185,42 @@ function createTransfers(
       })
   );
 }
+
+async function completeTokens(
+  ctx: Context,
+  partialTokensMap: Map<string, PartialToken>
+): Promise<Map<string, Token>> {
+  let partialTokens: PartialToken[] = [...partialTokensMap.values()];
+
+  let tokens: Map<string, Token> = new Map();
+  if (partialTokens.length === 0) return tokens;
+
+  let lastBatchedBlockHeader = ctx.blocks[ctx.blocks.length - 1].header;
+  let contract = new Multicall(ctx, lastBatchedBlockHeader, MULTICALL_ADDRESS);
+
+  let tokenURIs = await contract.aggregate(
+    nouns.functions.tokenURI,
+    NOUNS_ADDRESS,
+    partialTokens.map(t => [BigNumber.from(t.tokenId)]),
+    MULTICALL_BATCH_SIZE
+  );
+
+  console.log(`Retrieving metadata for ${partialTokens.length} tokens...`);
+
+  for (let [i, ptoken] of partialTokens.entries()) {
+    let uri = tokenURIs[i];
+    let metadata: TokenMetadata | undefined = await fetchTokenMetadata(ctx, uri);
+    tokens.set(
+      ptoken.id,
+      new Token({
+        ...ptoken,
+        uri,
+        ...metadata,
+      })
+    );
+  }
+
+  return tokens;
+}
+
+
